@@ -121,12 +121,19 @@ class EmbeddingGenerator:
 class Neo4jKnowledgeGraph:
     """Handles Neo4j database operations and knowledge graph creation"""
     
-    def __init__(self, uri: str, username: str, password: str):
+    def __init__(self, uri: str, username: str, password: str, database: str = "neo4j"):
         self.uri = uri
         self.username = username  
         self.password = password
+        self.database = database
         # In real implementation:
         # self.driver = GraphDatabase.driver(uri, auth=(username, password))
+        
+    def get_session(self):
+        """Get database session with specified database name"""
+        # In real implementation:
+        # return self.driver.session(database=self.database)
+        pass
         
     def create_document_nodes(self, chunks: List[DocumentChunk]):
         """Create document and chunk nodes in Neo4j"""
@@ -153,7 +160,7 @@ class Neo4jKnowledgeGraph:
         """
         
         # In real implementation, you'd execute these with:
-        # with self.driver.session() as session:
+        # with self.driver.session(database=self.database) as session:
         #     session.run(query, parameters)
         
         print(f"Would create {len(chunks)} chunk nodes in Neo4j")

@@ -43,6 +43,7 @@ def check_environment():
         'NEO4J_URI',
         'NEO4J_USERNAME', 
         'NEO4J_PASSWORD',
+        'NEO4J_DATABASE',
         'OPENAI_API_KEY'
     ]
     
@@ -70,10 +71,11 @@ def check_neo4j_connection():
         uri = os.getenv('NEO4J_URI')
         username = os.getenv('NEO4J_USERNAME')
         password = os.getenv('NEO4J_PASSWORD')
+        database = os.getenv('NEO4J_DATABASE', 'neo4j')
         
         driver = GraphDatabase.driver(uri, auth=(username, password))
         
-        with driver.session() as session:
+        with driver.session(database=database) as session:
             result = session.run("RETURN 1 as test")
             result.single()
         
