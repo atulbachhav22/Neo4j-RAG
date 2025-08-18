@@ -121,11 +121,25 @@ class EmbeddingGenerator:
 class Neo4jKnowledgeGraph:
     """Handles Neo4j database operations and knowledge graph creation"""
     
-    def __init__(self, uri: str, username: str, password: str, database: str = "neo4j"):
+    def __init__(self, uri: str, username: str, password: str, database: str = "neo4j", openai_api_key: str = None):
         self.uri = uri
         self.username = username  
         self.password = password
         self.database = database
+        self.openai_api_key = openai_api_key
+        
+        # Initialize OpenAI client if API key is provided
+        if openai_api_key:
+            try:
+                import openai
+                self.openai_client = openai.OpenAI(api_key=openai_api_key)
+                print("✅ OpenAI client initialized for LLM entity extraction")
+            except ImportError:
+                print("❌ OpenAI package not installed. Run: pip install openai")
+                self.openai_client = None
+        else:
+            self.openai_client = None
+            
         try:
             from neo4j import GraphDatabase
             self.driver = GraphDatabase.driver(uri, auth=(username, password))
@@ -396,6 +410,310 @@ class Neo4jKnowledgeGraph:
             print(f"❌ Error extracting entities: {e}")
             raise
     
+    def extract_entities_with_llm(self, chunks: List[DocumentChunk], batch_size: int = 5):
+        """Extract entities using LLM (OpenAI) for better accuracy and relationships"""
+        if not self.driver:
+            print("❌ Neo4j driver not available")
+            return
+        
+        if not self.openai_client:
+            print("❌ OpenAI client not initialized. Falling back to spaCy extraction.")
+            return self.extract_entities_and_create_graph(chunks)
+        
+        try:
+            with self.get_session() as session:
+                entities_created = 0
+                relationships_created = 0
+                entity_relationships_created = 0
+                
+                # Process chunks in batches to avoid token limits
+                for i in range(0, len(chunks), batch_size):
+                    batch_chunks = chunks[i:i + batch_size]
+                    
+                    # Prepare batch text for LLM
+                    batch_text = "\n\n---CHUNK_SEPARATOR---\n\n".join([
+                        f"CHUNK_{j}: {chunk.content}" 
+                        for j, chunk in enumerate(batch_chunks)
+                    ])
+                    
+                    # LLM prompt for entity extraction
+                    extraction_prompt = f"""
+Extract entities and their relationships from the following text chunks. 
+For each entity, provide:
+1. Entity name (normalized form)
+2. Entity type (PERSON, ORGANIZATION, LOCATION, CONCEPT, EVENT, PRODUCT, DATE, TECHNOLOGY)
+3. Chunk number where it appears
+4. Relationships with other entities (if any)
+5. Confidence score (0.0-1.0)
+
+Text chunks:
+{batch_text}
+
+Return the results in the following JSON format:
+{{
+  "entities": [
+    {{
+      "name": "Entity Name",
+      "type": "ENTITY_TYPE",
+      "chunks": [0, 1],
+      "confidence": 0.95,
+      "description": "Brief description of the entity"
+    }}
+  ],
+  "relationships": [
+    {{
+      "source": "Entity 1",
+      "target": "Entity 2", 
+      "relationship": "WORKS_FOR|LOCATED_IN|PART_OF|RELATED_TO|CREATED_BY",
+      "confidence": 0.90,
+      "description": "Description of the relationship"
+    }}
+  ]
+}}
+
+Focus on extracting meaningful entities and relationships that would be valuable for knowledge graph queries.
+"""
+                    
+                    try:
+                        # Call OpenAI API
+                        response = self.openai_client.chat.completions.create(
+                            model="gpt-4-turbo-preview",
+                            messages=[
+                                {
+                                    "role": "system", 
+                                    "content": "You are an expert knowledge graph entity extractor. Extract entities and relationships accurately from text."
+                                },
+                                {"role": "user", "content": extraction_prompt}
+                            ],
+                            temperature=0.1,
+                            max_tokens=2000
+                        )
+                        
+                        # Parse LLM response
+                        import json
+                        llm_result = json.loads(response.choices[0].message.content)
+                        
+                        # Process extracted entities
+                        for entity_data in llm_result.get("entities", []):
+                            entity_name = entity_data["name"].strip()
+                            entity_type = entity_data["type"]
+                            confidence = entity_data.get("confidence", 0.8)
+                            description = entity_data.get("description", "")
+                            
+                            # Create entity node
+                            create_entity_query = """
+                            MERGE (e:Entity {
+                                name: $name,
+                                type: $entity_type
+                            })
+                            SET e.confidence = $confidence,
+                                e.description = $description,
+                                e.extraction_method = 'LLM',
+                                e.created_at = coalesce(e.created_at, datetime()),
+                                e.updated_at = datetime()
+                            RETURN e.name as name
+                            """
+                            
+                            result = session.run(create_entity_query, {
+                                'name': entity_name,
+                                'entity_type': entity_type,
+                                'confidence': confidence,
+                                'description': description
+                            })
+                            
+                            if result.single():
+                                entities_created += 1
+                            
+                            # Create relationships between chunks and entities
+                            for chunk_idx in entity_data.get("chunks", []):
+                                if chunk_idx < len(batch_chunks):
+                                    chunk = batch_chunks[chunk_idx]
+                                    
+                                    create_mention_query = """
+                                    MATCH (c:Chunk {id: $chunk_id})
+                                    MATCH (e:Entity {name: $entity_name, type: $entity_type})
+                                    MERGE (c)-[:MENTIONS {
+                                        confidence: $confidence,
+                                        extraction_method: 'LLM',
+                                        created_at: datetime()
+                                    }]->(e)
+                                    """
+                                    
+                                    session.run(create_mention_query, {
+                                        'chunk_id': chunk.id,
+                                        'entity_name': entity_name,
+                                        'entity_type': entity_type,
+                                        'confidence': confidence
+                                    })
+                                    
+                                    relationships_created += 1
+                        
+                        # Process entity relationships
+                        for rel_data in llm_result.get("relationships", []):
+                            source_entity = rel_data["source"].strip()
+                            target_entity = rel_data["target"].strip()
+                            relationship_type = rel_data["relationship"]
+                            rel_confidence = rel_data.get("confidence", 0.8)
+                            rel_description = rel_data.get("description", "")
+                            
+                            # Create relationship between entities
+                            create_entity_rel_query = f"""
+                            MATCH (e1:Entity {{name: $source_name}})
+                            MATCH (e2:Entity {{name: $target_name}})
+                            MERGE (e1)-[r:{relationship_type} {{
+                                confidence: $confidence,
+                                description: $description,
+                                extraction_method: 'LLM',
+                                created_at: datetime()
+                            }}]->(e2)
+                            RETURN type(r) as relationship_type
+                            """
+                            
+                            result = session.run(create_entity_rel_query, {
+                                'source_name': source_entity,
+                                'target_name': target_entity,
+                                'confidence': rel_confidence,
+                                'description': rel_description
+                            })
+                            
+                            if result.single():
+                                entity_relationships_created += 1
+                        
+                        print(f"✅ Processed batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
+                        
+                    except json.JSONDecodeError as e:
+                        print(f"❌ Failed to parse LLM response for batch {i//batch_size + 1}: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"❌ Error processing batch {i//batch_size + 1}: {e}")
+                        continue
+                
+                print(f"🤖 LLM Entity Extraction Results:")
+                print(f"   👥 Created {entities_created} entity nodes")
+                print(f"   🔗 Created {relationships_created} mention relationships")
+                print(f"   🤝 Created {entity_relationships_created} entity relationships")
+                
+        except ImportError as e:
+            print(f"❌ Missing required packages for LLM entity extraction: {e}")
+            print("Install with: pip install openai")
+        except Exception as e:
+            print(f"❌ Error in LLM entity extraction: {e}")
+            raise
+    
+    def extract_relationships_with_llm(self, entity_pairs: List[tuple], context_chunks: List[str]):
+        """Extract specific relationships between entity pairs using LLM"""
+        if not self.openai_client:
+            print("❌ OpenAI client not available")
+            return
+        
+        try:
+            with self.get_session() as session:
+                relationships_created = 0
+                
+                # Process entity pairs in batches
+                batch_size = 10
+                for i in range(0, len(entity_pairs), batch_size):
+                    batch_pairs = entity_pairs[i:i + batch_size]
+                    
+                    # Prepare context
+                    context_text = "\n\n".join(context_chunks[:5])  # Limit context
+                    
+                    # Create pairs text
+                    pairs_text = "\n".join([
+                        f"{idx + 1}. {pair[0]} <-> {pair[1]}" 
+                        for idx, pair in enumerate(batch_pairs)
+                    ])
+                    
+                    relationship_prompt = f"""
+Analyze the relationships between the following entity pairs based on the provided context.
+For each pair, determine if there's a meaningful relationship and specify:
+1. Relationship type (WORKS_FOR, LOCATED_IN, PART_OF, CREATED_BY, COLLABORATES_WITH, COMPETES_WITH, etc.)
+2. Confidence score (0.0-1.0)
+3. Direction (bidirectional or source->target)
+4. Brief explanation
+
+Entity pairs to analyze:
+{pairs_text}
+
+Context:
+{context_text}
+
+Return results in JSON format:
+{{
+  "relationships": [
+    {{
+      "source": "Entity 1",
+      "target": "Entity 2",
+      "relationship": "RELATIONSHIP_TYPE",
+      "confidence": 0.85,
+      "bidirectional": false,
+      "explanation": "Brief explanation of the relationship"
+    }}
+  ]
+}}
+
+Only include relationships with confidence > 0.7.
+"""
+                    
+                    try:
+                        response = self.openai_client.chat.completions.create(
+                            model="gpt-4-turbo-preview",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": "You are an expert at identifying relationships between entities in text. Be precise and only identify clear, meaningful relationships."
+                                },
+                                {"role": "user", "content": relationship_prompt}
+                            ],
+                            temperature=0.1,
+                            max_tokens=1500
+                        )
+                        
+                        import json
+                        result = json.loads(response.choices[0].message.content)
+                        
+                        # Create relationships in Neo4j
+                        for rel in result.get("relationships", []):
+                            if rel["confidence"] > 0.7:
+                                create_rel_query = f"""
+                                MATCH (e1:Entity {{name: $source}})
+                                MATCH (e2:Entity {{name: $target}})
+                                MERGE (e1)-[r:{rel["relationship"]} {{
+                                    confidence: $confidence,
+                                    explanation: $explanation,
+                                    extraction_method: 'LLM_RELATIONSHIP',
+                                    created_at: datetime()
+                                }}]->(e2)
+                                """
+                                
+                                session.run(create_rel_query, {
+                                    'source': rel["source"],
+                                    'target': rel["target"],
+                                    'confidence': rel["confidence"],
+                                    'explanation': rel["explanation"]
+                                })
+                                
+                                # Create bidirectional if specified
+                                if rel.get("bidirectional", False):
+                                    session.run(create_rel_query, {
+                                        'source': rel["target"],
+                                        'target': rel["source"],
+                                        'confidence': rel["confidence"],
+                                        'explanation': rel["explanation"]
+                                    })
+                                
+                                relationships_created += 1
+                        
+                    except Exception as e:
+                        print(f"❌ Error processing relationship batch: {e}")
+                        continue
+                
+                print(f"🔗 Created {relationships_created} LLM-extracted relationships")
+                
+        except Exception as e:
+            print(f"❌ Error in LLM relationship extraction: {e}")
+            raise
+    
     def get_document_stats(self):
         """Get statistics about the knowledge graph"""
         if not self.driver:
@@ -496,15 +814,23 @@ class SemanticSearch:
 class RAGSystem:
     """Main RAG system orchestrating all components"""
     
-    def __init__(self, pdf_folder: str, neo4j_config: Dict[str, str]):
+    def __init__(self, pdf_folder: str, neo4j_config: Dict[str, str], openai_api_key: str = None):
         self.pdf_processor = PDFProcessor(pdf_folder)
         self.chunker = TextChunker()
         self.embedding_generator = EmbeddingGenerator()
-        self.knowledge_graph = Neo4jKnowledgeGraph(**neo4j_config)
+        self.knowledge_graph = Neo4jKnowledgeGraph(**neo4j_config, openai_api_key=openai_api_key)
         self.semantic_search = SemanticSearch(self.knowledge_graph, self.embedding_generator)
         
         # In real implementation, initialize LLM:
-        # self.llm = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        if openai_api_key:
+            try:
+                import openai
+                self.llm_client = openai.OpenAI(api_key=openai_api_key)
+            except ImportError:
+                print("❌ OpenAI package not installed")
+                self.llm_client = None
+        else:
+            self.llm_client = None
     
     def ingest_documents(self):
         """Complete document ingestion pipeline"""
@@ -531,7 +857,15 @@ class RAGSystem:
         # 4. Store in Neo4j and create knowledge graph
         self.knowledge_graph.create_document_nodes(all_chunks)
         self.knowledge_graph.create_semantic_relationships(all_chunks)
-        self.knowledge_graph.extract_entities_and_create_graph(all_chunks)
+        
+        # Use LLM entity extraction if available, otherwise fall back to spaCy
+        if self.knowledge_graph.openai_client:
+            print("🤖 Using LLM for entity extraction...")
+            self.knowledge_graph.extract_entities_with_llm(all_chunks)
+        else:
+            print("📝 Using spaCy for entity extraction...")
+            self.knowledge_graph.extract_entities_and_create_graph(all_chunks)
+        
         print("Stored documents and created knowledge graph")
     
     def query(self, question: str) -> str:
@@ -572,11 +906,13 @@ def main():
     neo4j_config = {
         "uri": "bolt://localhost:7687",
         "username": "neo4j", 
-        "password": "password"
+        "password": "password",
+        "database": "neo4j"
     }
+    openai_api_key = os.getenv('OPENAI_API_KEY')
     
     # Initialize RAG system
-    rag_system = RAGSystem(pdf_folder, neo4j_config)
+    rag_system = RAGSystem(pdf_folder, neo4j_config, openai_api_key)
     
     # Ingest documents
     rag_system.ingest_documents()
